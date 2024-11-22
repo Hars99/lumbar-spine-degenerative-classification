@@ -1,0 +1,148 @@
+import tensorflow as tf
+import matplotlib.pyplot as plt
+import os
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input, Dense, GlobalAveragePooling2D, Concatenate, Conv2D, MaxPooling2D, Flatten, Dropout
+from tensorflow.keras.applications import DenseNet121
+from sklearn.utils.class_weight import compute_class_weight
+import numpy as np
+
+# Define the feature description for parsing the TFRecord
+feature_description = {
+    "image/encoded": tf.io.FixedLenFeature([], tf.string),
+    "image/height": tf.io.FixedLenFeature([], tf.int64),
+    "image/width": tf.io.FixedLenFeature([], tf.int64),
+    "image/object/class/label": tf.io.VarLenFeature(tf.int64),
+}
+
+# Define the augmentation layers
+data_augmentation = tf.keras.Sequential([
+    tf.keras.layers.RandomFlip("horizontal_and_vertical"),
+    tf.keras.layers.RandomRotation(0.2),
+    tf.keras.layers.RandomZoom(0.2)
+])
+
+# Parsing function with augmentation
+def parse_function_with_augmentation(example_proto):
+    image, label = parse_function(example_proto)
+    image = data_augmentation(image)
+    return image, label
+
+# Parsing function
+def parse_function(example_proto):
+    parsed_features = tf.io.parse_single_example(example_proto, feature_description)
+    image = tf.io.decode_jpeg(parsed_features["image/encoded"], channels=3)
+    labels = tf.sparse.to_dense(parsed_features["image/object/class/label"])
+    image = tf.image.resize(image, [224, 224])
+    label = tf.reduce_any(tf.equal(labels, 1))  # Label is 1 if any class label is 1
+    return image, tf.cast(label, tf.int32)
+
+# Balanced augmentation function
+def balanced_augmentation(tfrecord_path):
+    raw_dataset = tf.data.TFRecordDataset([os.path.join(tfrecord_path, f) for f in os.listdir(tfrecord_path) if f.endswith('.tfrecord')])
+
+    # Separate "Normal Spine" (0) and "Degenerative Spine" (1)
+    def filter_normal(example_proto):
+        _, label = parse_function(example_proto)
+        return tf.equal(label, 0)
+
+    def filter_degenerative(example_proto):
+        _, label = parse_function(example_proto)
+        return tf.equal(label, 1)
+
+    normal = raw_dataset.filter(filter_normal)
+    degenerative = raw_dataset.filter(filter_degenerative)
+
+    # Oversample "Normal Spine" (class 0)
+    normal = normal.repeat(3)  # Oversample by repeating 3 times
+    degenerative = degenerative.repeat(1)  # Degenerative samples remain the same
+
+    # Combine and shuffle
+    balanced_dataset = normal.concatenate(degenerative).shuffle(1000)
+    balanced_dataset = balanced_dataset.map(parse_function_with_augmentation).batch(32).prefetch(tf.data.AUTOTUNE)
+    return balanced_dataset
+
+# Load validation dataset
+def load_dataset(tfrecord_path, augment=False):
+    tfrecord_files = [os.path.join(tfrecord_path, f) for f in os.listdir(tfrecord_path) if f.endswith('.tfrecord')]
+    raw_dataset = tf.data.TFRecordDataset(tfrecord_files)
+    if augment:
+        dataset = raw_dataset.map(parse_function_with_augmentation)
+    else:
+        dataset = raw_dataset.map(parse_function)
+    dataset = dataset.shuffle(1000).batch(32).prefetch(tf.data.AUTOTUNE)
+    return dataset
+# Create a custom CNN model
+def create_custom_cnn(input_shape):
+    cnn_input = Input(shape=input_shape, name="cnn_input")
+    x = Conv2D(32, (3, 3), activation='relu', padding='same')(cnn_input)
+    x = MaxPooling2D((2, 2))(x)
+    x = Conv2D(64, (3, 3), activation='relu', padding='same')(x)
+    x = MaxPooling2D((2, 2))(x)
+    x = Conv2D(128, (3, 3), activation='relu', padding='same')(x)
+    x = GlobalAveragePooling2D()(x)
+    return Model(inputs=cnn_input, outputs=x, name="Custom_CNN")
+
+# Hybrid DenseNet + Custom CNN model
+def create_custom_model():
+    densenet_input = Input(shape=(224, 224, 3), name='densenet_input')
+    densenet_base = DenseNet121(weights='imagenet', include_top=False, input_tensor=densenet_input)
+    densenet_base.trainable = True
+    for layer in densenet_base.layers[:100]:  # Freeze initial DenseNet layers
+        layer.trainable = False
+    densenet_output = GlobalAveragePooling2D(name='densenet_gap')(densenet_base.output)
+
+    custom_cnn = create_custom_cnn(input_shape=(224, 224, 3))
+    cnn_output = custom_cnn(densenet_input)
+
+    combined = Concatenate(name="concat_features")([densenet_output, cnn_output])
+    dense_layer = Dense(256, activation='relu', name='dense_layer')(combined)
+    dense_layer = Dropout(0.5)(dense_layer)
+    output = Dense(1, activation='sigmoid', name='output_layer')(dense_layer)
+
+    return Model(inputs=densenet_input, outputs=output, name="Hybrid_DenseNet_CNN_Model")
+
+# Load training and validation datasets
+train_dataset = balanced_augmentation('/content/drive/MyDrive/Augmented_dataset.v1i.tfrecord/train')
+valid_dataset = load_dataset('/content/drive/MyDrive/Augmented_dataset.v1i.tfrecord/valid', augment=False)
+
+# Compute class weights
+labels = []
+for _, label in load_dataset('/content/drive/MyDrive/Augmented_dataset.v1i.tfrecord/train', augment=False):
+    labels.extend(label.numpy())
+
+class_weights = compute_class_weight(
+    class_weight='balanced',
+    classes=np.unique(labels),
+    y=labels
+)
+class_weights = dict(enumerate(class_weights))
+print("Class Weights:", class_weights)
+
+# Initialize the model
+model = create_custom_model()
+model.summary()
+
+# Compile the model
+lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
+    initial_learning_rate=0.001,
+    decay_steps=10000,
+    decay_rate=0.9
+)
+optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
+model.compile(optimizer=optimizer, loss='binary_crossentropy', metrics=['accuracy', tf.keras.metrics.Recall(name='recall')])
+
+# Train the model
+history = model.fit(
+    train_dataset,
+    epochs=10,
+    validation_data=valid_dataset,
+    class_weight=class_weights
+)
+
+# Evaluate the model
+val_loss, val_accuracy, val_recall = model.evaluate(valid_dataset, verbose=1)
+print(f"Validation Accuracy: {val_accuracy * 100:.2f}%, Validation Recall: {val_recall * 100:.2f}%")
+
+# Save the model
+model.save('binary_classification_model.h5')
