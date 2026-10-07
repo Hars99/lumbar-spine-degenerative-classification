@@ -1,0 +1,31 @@
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local configuration and logs
+.env
+.env.*
+!.env.example
+*.log
+
+# Datasets and generated ML artifacts
+data/
+datasets/
+*.tfrecord
+*.tfrecords
+*.h5
+*.keras
+checkpoints/
+logs/
+runs/
+outputs/
+
+# Operating system and IDE files
+.DS_Store
+Thumbs.db
+.idea/
